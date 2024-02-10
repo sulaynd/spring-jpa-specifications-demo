@@ -1,0 +1,98 @@
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+stages:
+  - build
+  - test
+  - package
+  - release
+  - deploy:dev
+  - deploy:staging
+  - deploy:prod
+
+
+.non-release: &non-release
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: always
+cache:
+  paths:
+    - "build"
+    - ".$DEPENDENCY_MANAGER"
+  policy: pull-push
+
+"Build Application":
+  <<: *non-release 
+  image: "$DEPENDENCY_MANAGER:jdk21-alpine"
+  stage: build
+  script:
+    - sh mvnw clean package -Dmaven.test.skip=true -s settings.xml -P $TEAM
+
+"Test Application":
+  <<: *non-release 
+  stage: test
+  image: "$DEPENDENCY_MANAGER:jdk21-alpine" # "openjdk:21-jdk-buster"
+  script:
+      - sh mvnw test -s settings.xml -P $TEAM
+
+"Build Container":
+  <<: *non-release 
+  stage: package
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+      --destination "${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}"
+
+"Package Release":
+  <<: *non-release 
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - >
+      release-cli create --name $CI_COMMIT_BRANCH --description $CI_COMMIT_BRANCH-$CI_JOB_ID
+      --tag-name $CI_COMMIT_BRANCH --ref $CI_COMMIT_SHA
+      --assets-link "{\"name\":\"Docker Container\",\"url\":\"https://${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}\"}"
+  environment:
+    name: release
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /v\d.+/'
+      when: manual
+    - when: never
+
+.deploy-job:
+  image: node:latest
+  script: "echo 'Deploy to Environment'"
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: manual
+    - if: '$FORCE_DEPLOY == "true"'
+      when: manual
+
+"Deploy To Dev":
+  extends: .deploy-job
+  stage: deploy:dev
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: always
+    - if: '$FORCE_DEPLOY == "true"'
+      when: always
+
+"Deploy To Staging":
+  extends: .deploy-job
+  stage: deploy:staging
+
+"Deploy To Prod":
+  extends: .deploy-job
+  stage: deploy:prod
+
+
